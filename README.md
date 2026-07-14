@@ -1,4 +1,4 @@
-# MCbot
+# For Trying
 
 My first practice project for learning Git and GitHub.
 
