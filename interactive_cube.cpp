@@ -1,31 +1,38 @@
 // Interactive ASCII cube — drag with the left mouse button to rotate it,
 // release mid-drag and it keeps spinning with momentum (friction slows it down).
 //
-// Builds on the same idea as the spinning donut: rotate geometry each frame,
-// project to 2D, shade by surface normal vs light direction. Since a cube is
-// convex, backface culling (skip faces pointing away from the camera) replaces
-// the donut's per-pixel z-buffer, and visible faces are drawn back-to-front.
+// Cross-platform (Linux/macOS/WSL) version: uses ANSI/xterm mouse reporting
+// instead of a Windows-only console API, so this also works over SSH.
 //
-// Compile (MinGW / g++ on Windows):
-//   g++ -O2 -o cube.exe interactive_cube.cpp
-// Run in a real console window (cmd.exe or Windows Terminal):
-//   cube.exe
+// Same math as before: rotate geometry each frame, project to 2D, shade by
+// surface normal vs light direction. A cube is convex, so backface culling
+// (skip faces pointing away from the camera) replaces a full z-buffer, and
+// visible faces are drawn back-to-front (painter's algorithm).
+//
+// Compile:
+//   g++ -O2 -o cube interactive_cube.cpp
+// Run (in a real terminal, local or over SSH):
+//   ./cube
 // Click and drag with the left mouse button. Ctrl+C to quit.
 
-#include <windows.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <csignal>
 #include <vector>
+#include <string>
 #include <algorithm>
+#include <unistd.h>
+#include <termios.h>
+#include <fcntl.h>
 
 const int W = 80, H = 30;
 const float SCALE = 40.0f;
-const float DIST = 5.0f; // distance of cube from camera along z
+const float DIST = 5.0f;
 
 struct Vec3 { float x, y, z; };
 
-// Rotate a point: yaw around Y axis, then pitch around X axis
 Vec3 rotate(Vec3 v, float pitch, float yaw) {
     float x1 = v.x * cosf(yaw) + v.z * sinf(yaw);
     float z1 = -v.x * sinf(yaw) + v.z * cosf(yaw);
@@ -40,7 +47,7 @@ Point2D project(Vec3 v) {
     float z = v.z + DIST;
     float ooz = 1.0f / z;
     int sx = (int)(W / 2 + SCALE * v.x * ooz);
-    int sy = (int)(H / 2 - SCALE * 0.5f * v.y * ooz); // 0.5 corrects for character cell aspect ratio
+    int sy = (int)(H / 2 - SCALE * 0.5f * v.y * ooz);
     return { sx, sy };
 }
 
@@ -50,12 +57,7 @@ Vec3 vertices[8] = {
 };
 
 int faces[6][4] = {
-    {0,1,2,3}, // front  (z = -1)
-    {5,4,7,6}, // back   (z = +1)
-    {4,0,3,7}, // left   (x = -1)
-    {1,5,6,2}, // right  (x = +1)
-    {3,2,6,7}, // top    (y = +1)
-    {4,5,1,0}  // bottom (y = -1)
+    {0,1,2,3}, {5,4,7,6}, {4,0,3,7}, {1,5,6,2}, {3,2,6,7}, {4,5,1,0}
 };
 
 Vec3 faceNormals[6] = {
@@ -64,7 +66,6 @@ Vec3 faceNormals[6] = {
 
 char screen[H][W];
 
-// Scanline fill for a 4-point polygon
 void fillPolygon(Point2D pts[4], char ch) {
     int minY = H, maxY = 0;
     for (int i = 0; i < 4; i++) { minY = std::min(minY, pts[i].y); maxY = std::max(maxY, pts[i].y); }
@@ -88,14 +89,79 @@ void fillPolygon(Point2D pts[4], char ch) {
     }
 }
 
+// --- terminal / mouse handling (ANSI escape sequences, works locally and over SSH) ---
+struct termios orig_termios;
+
+void restoreTerminal() {
+    tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+    printf("\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?25h"); // disable mouse reporting, show cursor
+    fflush(stdout);
+}
+
+void handleSignal(int) {
+    restoreTerminal();
+    exit(0);
+}
+
+void setupTerminal() {
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+
+    printf("\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?25l"); // enable button+motion mouse reporting, hide cursor
+    fflush(stdout);
+
+    signal(SIGINT, handleSignal);
+    atexit(restoreTerminal);
+}
+
+std::string inputBuf;
+
+void pollMouseEvents(float& yaw, float& pitch, float& velYaw, float& velPitch,
+                      bool& dragging, int& lastX, int& lastY) {
+    char buf[256];
+    ssize_t n;
+    while ((n = read(STDIN_FILENO, buf, sizeof(buf))) > 0) {
+        inputBuf.append(buf, n);
+    }
+
+    size_t pos;
+    while ((pos = inputBuf.find("\x1b[<")) != std::string::npos) {
+        size_t end = inputBuf.find_first_of("Mm", pos);
+        if (end == std::string::npos) break; // incomplete sequence, wait for more bytes
+        std::string seq = inputBuf.substr(pos + 3, end - pos - 3);
+        char type = inputBuf[end];
+        inputBuf.erase(0, end + 1);
+
+        int cb, cx, cy;
+        if (sscanf(seq.c_str(), "%d;%d;%d", &cb, &cx, &cy) == 3) {
+            if (type == 'M') { // press, or motion while a button is held
+                if (dragging) {
+                    int dx = cx - lastX;
+                    int dy = cy - lastY;
+                    velYaw = dx * 0.05f;
+                    velPitch = dy * 0.05f;
+                    yaw += velYaw;
+                    pitch += velPitch;
+                }
+                dragging = true;
+                lastX = cx;
+                lastY = cy;
+            } else { // 'm' = release
+                dragging = false;
+            }
+        }
+    }
+}
+
 int main() {
-    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD prevMode;
-    GetConsoleMode(hIn, &prevMode);
-    // ENABLE_EXTENDED_FLAGS without ENABLE_QUICK_EDIT_MODE turns off text-selection
-    // capture so mouse drags reach the app instead of the console's own selection UI.
-    SetConsoleMode(hIn, ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT);
+    setupTerminal();
 
     float pitch = 0.3f, yaw = 0.5f;
     float velPitch = 0, velYaw = 0;
@@ -106,35 +172,8 @@ int main() {
     const Vec3 light = {0.4f, 0.6f, -1.0f};
 
     while (true) {
-        // --- drain pending mouse events ---
-        DWORD events = 0;
-        GetNumberOfConsoleInputEvents(hIn, &events);
-        while (events-- > 0) {
-            INPUT_RECORD rec;
-            DWORD read;
-            ReadConsoleInput(hIn, &rec, 1, &read);
-            if (rec.EventType == MOUSE_EVENT) {
-                MOUSE_EVENT_RECORD& m = rec.Event.MouseEvent;
-                bool leftDown = m.dwButtonState & FROM_LEFT_1ST_BUTTON_PRESSED;
-                if (leftDown) {
-                    if (dragging) {
-                        int dx = m.dwMousePosition.X - lastX;
-                        int dy = m.dwMousePosition.Y - lastY;
-                        velYaw = dx * 0.05f;
-                        velPitch = dy * 0.05f;
-                        yaw += velYaw;
-                        pitch += velPitch;
-                    }
-                    dragging = true;
-                    lastX = m.dwMousePosition.X;
-                    lastY = m.dwMousePosition.Y;
-                } else {
-                    dragging = false;
-                }
-            }
-        }
+        pollMouseEvents(yaw, pitch, velYaw, velPitch, dragging, lastX, lastY);
 
-        // momentum spin when not actively dragging
         if (!dragging) {
             yaw += velYaw;
             pitch += velPitch;
@@ -142,7 +181,6 @@ int main() {
             velPitch *= 0.95f;
         }
 
-        // --- build the frame ---
         memset(screen, ' ', sizeof(screen));
 
         struct FaceDraw { float depth; Point2D pts[4]; char ch; };
@@ -150,7 +188,7 @@ int main() {
 
         for (int f = 0; f < 6; f++) {
             Vec3 n = rotate(faceNormals[f], pitch, yaw);
-            if (n.z >= 0) continue; // backface cull: camera looks down +z, skip faces pointing away
+            if (n.z >= 0) continue;
 
             Point2D pts[4];
             float depth = 0;
@@ -168,23 +206,20 @@ int main() {
             drawList.push_back({ depth, { pts[0], pts[1], pts[2], pts[3] }, shades[shadeIdx] });
         }
 
-        // painter's algorithm: draw farthest face first so nearer faces overwrite it
         std::sort(drawList.begin(), drawList.end(), [](const FaceDraw& a, const FaceDraw& b) {
             return a.depth > b.depth;
         });
         for (auto& fd : drawList) fillPolygon(fd.pts, fd.ch);
 
-        // --- draw without clearing the screen (avoids flicker vs system("cls")) ---
-        COORD topLeft = {0, 0};
-        SetConsoleCursorPosition(hOut, topLeft);
+        printf("\x1b[H"); // cursor home (avoids flicker vs clearing the whole screen)
         for (int y = 0; y < H; y++) {
             fwrite(screen[y], 1, W, stdout);
             putchar('\n');
         }
+        fflush(stdout);
 
-        Sleep(16); // ~60 fps
+        usleep(16000); // ~60 fps
     }
 
-    SetConsoleMode(hIn, prevMode);
     return 0;
 }
