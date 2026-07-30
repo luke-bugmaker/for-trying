@@ -109,7 +109,7 @@ void fillQuad(Point2D p[4], char c) {
 struct termios orig_termios;
 void restoreTerminal() {
     tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
-    printf("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h");
+    printf("\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?25h");
     fflush(stdout);
 }
 void handleSignal(int) { restoreTerminal(); exit(0); }
@@ -121,17 +121,16 @@ void setupTerminal() {
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-    // 1003 reports ALL mouse motion, not just while a button is held, so the
-    // racket tracks the cursor continuously. Swap 1003 for 1002 (as in the
-    // cube demo) if you'd rather require holding a button to move it.
-    printf("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?25l\x1b[2J");
+    // Click-and-drag racket control (same mouse mode as the cube demo) —
+    // hold the left mouse button and move it to steer the racket.
+    printf("\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?25l\x1b[2J");
     fflush(stdout);
     signal(SIGINT, handleSignal);
     atexit(restoreTerminal);
 }
 
 std::string inputBuf;
-bool haveMouse = false;
+bool dragging = false;
 int mouseX = 0, mouseY = 0;
 
 void pollMouse() {
@@ -142,10 +141,12 @@ void pollMouse() {
         size_t end = inputBuf.find_first_of("Mm", pos);
         if (end == std::string::npos) break;
         std::string seq = inputBuf.substr(pos + 3, end - pos - 3);
+        char type = inputBuf[end];
         inputBuf.erase(0, end + 1);
         int cb, cx, cy;
         if (sscanf(seq.c_str(), "%d;%d;%d", &cb, &cx, &cy) == 3) {
-            mouseX = cx; mouseY = cy; haveMouse = true;
+            mouseX = cx; mouseY = cy;
+            dragging = (type == 'M'); // 'M' = pressed/dragging, 'm' = released
         }
     }
 }
@@ -195,7 +196,7 @@ int main() {
 
     while (true) {
         pollMouse();
-        if (haveMouse) mouseToRacket(racketX, racketY);
+        if (dragging) mouseToRacket(racketX, racketY);
         float racketVX = (racketX - prevRacketX) / DT;
         float racketVY = (racketY - prevRacketY) / DT;
         prevRacketX = racketX; prevRacketY = racketY;
@@ -293,6 +294,8 @@ int main() {
         for (int y = 0; y < H; y++) { fwrite(screen[y], 1, W, stdout); putchar('\n'); }
         printf("Rally: %d   Best: %d   Resets: %d   (mode: %s)   Ctrl+C to quit\n",
                rally, bestRally, resets, mode == MODE_WALL ? "wall" : "AI");
+        printf("[debug] drag:%s mouseRaw:(%d,%d) racket:(%.2f,%.2f) ball:(%.2f,%.2f,%.2f)   \n",
+               dragging ? "Y" : "N", mouseX, mouseY, racketX, racketY, ball.pos.x, ball.pos.y, ball.pos.z);
         fflush(stdout);
 
         usleep(16000);
